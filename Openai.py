@@ -1,68 +1,80 @@
 
 from openai import OpenAI
-import os
 from dotenv import load_dotenv
 from fastapi import FastAPI
+from pydantic import BaseModel
+
 import psycopg2
+import os
+
+
 load_dotenv()
 key = os.getenv("api_key")
 client = OpenAI(api_key=key)
 
 app = FastAPI()
 
-def test_chat():
-    print("Sending message to OpenAI...")
-    response = client.chat.completions.create(
-        model='gpt-4.1-mini',
-        messages=[
-            {
-                'role':'system','content':'You are a sarcastic but helpful assistant'
-            },
-            {
-                'role':'user','content':'Explain what a Java Developer is in one sentence.'
-            }
-        ]
-    )
-    ans = response.choices[0].message.content
-    print('Ai says', ans)
-def test_embedding():
-    response = client.embeddings.create(
-        model='text-embedding-3-small',
-        input='This is a confidential HR document'
-    )
-    embedding = response.data[0].embedding
-    print(embedding)
-    print("Length of embedding:", len(embedding))
+class QueryRequest(BaseModel):
+    query: str
+class DocumentRequest(BaseModel):
+    text: str
 
-@app.post('/search')
-def search(query):
-    response = client.embeddings.create(
-        model='text-embedding-3-small',input=query
-    )
+def getEmbedding(text:str):
+    response = client.embeddings.create(model='text-embedding-3-small',input=text)
     embedding = response.data[0].embedding
+    return embedding
+
+
+def findEmbeddings(query):
+    embedding = getEmbedding(query)
     conn = psycopg2.connect(os.getenv('db_url'))
     cursor = conn.cursor()
-    cursor.execute('Select content from docs order by embedding <=> %s::vector  limit 3',(embedding,))
+    cursor.execute(
+        '''
+        SELECT content
+        FROM docs
+        ORDER BY embedding <=> %s::vector
+        LIMIT 3
+        ''',
+        (embedding,)
+    )
     res = cursor.fetchall()
     cursor.close()
     conn.close()
+    return [row[0] for row in res]
 
-    return res
+@app.post('/search')
+def search(query:QueryRequest):
+    res = findEmbeddings(query.query)
+    return {"Question":query.query,"Results":res}
 
-@app.post('/send')
-def send(query):
-    res = search(query)
-    response = client.chat.completions.create(model='gpt-4.1-mini',
-    messages=[
-        {'role':'system','content':'You are a senior tech assistant'},
-        {'role':'user','content':[query,res]}
+@app.post('/ask')
+def send(query:QueryRequest):
+    res = findEmbeddings(query.query)
+    context = "\n\n".join(res)
+    response = client.chat.completions.create(model='gpt-4.1-mini',messages=[
+        {'role':'system','content':"Answer using only the provided context. If the answer is not in the context, say you don't know."},
+        {'role':'user','content': f'''
+        Context: {context}
+
+        Question: {query.query}
+        '''
+        }
     ])
     ans = response.choices[0].message.content
-    return ans
+    return {"Answer":ans,"Sources":context}
 
+@app.post('/documents')
+def documents(request:DocumentRequest):
+    
+    response = client.embeddings.create(model='text-embedding-3-small',input=request.text)
+    embedding = response.data[0].embedding
+    conn = psycopg2.connect(os.getenv('db_url'))
+    cursor = conn.cursor()
+    cursor.execute('Insert into docs (text,embedding) values (%s,%s)',(request.text,embedding))
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return {"status": "stored"}
+    
 
-
-
-
-if __name__ == '__main__':
-    test_chat()
