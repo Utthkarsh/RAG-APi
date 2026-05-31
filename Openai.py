@@ -1,9 +1,9 @@
-
+from io import BytesIO
 from openai import OpenAI
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI,UploadFile,File
 from pydantic import BaseModel
-
+from pypdf import PdfReader
 import psycopg2
 import os
 
@@ -43,6 +43,12 @@ def findEmbeddings(query):
     conn.close()
     return [row[0] for row in res]
 
+def chunking(text,chunk_size=500):
+    chunks = []
+    for i in range(0,len(text),chunk_size):
+        chunks.append(text[i: i + chunk_size])
+    return chunks
+
 @app.post('/search')
 def search(query:QueryRequest):
     res = findEmbeddings(query.query)
@@ -76,5 +82,59 @@ def documents(request:DocumentRequest):
     cursor.close()
     conn.close()
     return {"status": "stored"}
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...)):
+    if file.content_type != "application/pdf":
+        return {"error": "Only PDF files are supported"}
+        
+    pdf_bytes = await file.read()
+    reader = PdfReader(BytesIO(pdf_bytes))
+
+    text = ""
+    for page in reader.pages:
+        page_text = page.extract_text()
+        if page_text:
+            text += page_text + "\n"
+
+    chunks = chunking(text)
+
+    conn = psycopg2.connect(os.getenv("db_url"))
+    cursor = conn.cursor()
+
+    for index, chunk in enumerate(chunks):
+        response = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=chunk
+        )
+
+        embedding = response.data[0].embedding
+
+        cursor.execute(
+            """
+            INSERT INTO docs (document_name, chunk, chunk_index, embedding)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (file.filename, chunk, index, embedding)
+        )
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+    return {
+        "file_name": file.filename,
+        "chunks_stored": len(chunks)
+    }
+
+
+
+
+
+        
     
+
+
+
+
 
